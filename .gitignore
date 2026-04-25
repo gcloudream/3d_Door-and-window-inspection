@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+
+# IDE / Tools
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.playwright-cli/
+.superpowers/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Large binary / data files
+*.pcd
+*.ply
+
+# Playwright outputs
+output/playwright/
+
+# Logs
+*.log

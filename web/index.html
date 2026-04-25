@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Point Cloud Picker Demo</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/web/styles.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="canvas-shell">
+        <div class="canvas-header">
+          <div>
+            <p class="eyebrow">3D Point Picker</p>
+            <h1>点击点云，提取局部 ROI</h1>
+          </div>
+          <div class="header-chip" id="status-chip">正在加载场景</div>
+        </div>
+        <div id="viewer" class="viewer-frame">
+          <div id="hover-indicator" class="hover-indicator hidden">
+            <span>悬停点</span>
+            <strong id="hover-point-id">-</strong>
+            <small id="hover-point-xyz">-</small>
+          </div>
+        </div>
+        <div class="viewer-footer">
+          <span>左键旋转</span>
+          <span>右键平移</span>
+          <span>滚轮缩放</span>
+          <span>选中后围绕目标旋转</span>
+          <span>点击一个点来高亮 ROI</span>
+        </div>
+      </section>
+
+      <aside class="info-panel">
+        <section class="panel-card controls-card">
+          <p class="eyebrow">Controls</p>
+          <div class="panel-heading">
+            <h2>交互参数</h2>
+            <div class="panel-actions">
+              <button id="augment-mode-toggle" class="secondary-button compact-button" type="button">补充模式</button>
+              <button id="refine-mode-toggle" class="secondary-button compact-button" type="button">排除模式</button>
+              <button id="clear-selection" class="secondary-button compact-button" type="button">清空高亮</button>
+            </div>
+          </div>
+          <label class="control">
+            <span>选择点云文件</span>
+            <input id="scene-file" type="file" accept=".ply,.json,.pcd" />
+            <small class="control-hint">支持 ASCII PLY、JSON 与 PCD；较大的点云会自动抽样后再进入门窗选取流程。</small>
+          </label>
+          <label class="control compact-input">
+            <span>点云密度</span>
+            <select id="scene-density">
+              <option value="180000">流畅 · 18 万</option>
+              <option value="300000" selected>推荐 · 30 万</option>
+              <option value="600000">精细 · 60 万</option>
+              <option value="1200000">高精度 · 120 万</option>
+            </select>
+            <small class="control-hint">切换后会重新加载当前场景；推荐档会多显示一批用于门窗边界判断的点，同时保持较稳的交互速度。</small>
+          </label>
+          <label class="control compact-input">
+            <span>候选筛选</span>
+            <select id="candidate-filter">
+              <option value="all">显示全部候选</option>
+              <option value="door">仅看门候选</option>
+              <option value="window">仅看窗候选</option>
+              <option value="unknown">仅看未识别</option>
+            </select>
+          </label>
+          <div class="controls-grid">
+            <label class="control slider-control">
+              <span>点大小</span>
+              <input id="point-size-scale" type="range" min="0.5" max="3.0" step="0.1" value="1.0" />
+              <strong id="point-size-scale-value">1.0x</strong>
+            </label>
+            <label class="control slider-control">
+              <span>ROI 半径</span>
+              <input id="roi-radius" type="range" min="0.2" max="1.8" step="0.1" value="0.8" />
+              <strong id="roi-radius-value">0.8 m</strong>
+            </label>
+            <label class="control slider-control">
+              <span>射线容差</span>
+              <input id="max-distance-to-ray" type="range" min="0.01" max="0.4" step="0.01" value="0.12" />
+              <strong id="max-distance-to-ray-value">0.12 m</strong>
+            </label>
+            <label class="control compact-input">
+              <span>最小点数</span>
+              <input id="roi-min-points" type="number" min="1" step="1" value="3" />
+            </label>
+            <label class="control compact-input">
+              <span>最大点数</span>
+              <input id="roi-max-points" type="number" min="1" step="1" value="2000" />
+            </label>
+          </div>
+          <div id="error-box" class="error-box hidden"></div>
+        </section>
+
+        <section class="panel-card telemetry-card" hidden>
+          <p class="eyebrow">Telemetry</p>
+          <div class="telemetry-strip">
+            <article class="summary-chip summary-scene">
+              <span>场景</span>
+              <strong id="scene-name">-</strong>
+            </article>
+            <article class="summary-chip summary-selection">
+              <span>选择</span>
+              <strong id="selection-title">等待点击</strong>
+            </article>
+            <article class="summary-chip summary-roi">
+              <span>ROI</span>
+              <strong id="roi-title">未生成</strong>
+            </article>
+          </div>
+          <dl class="stats-grid telemetry-stats">
+            <div class="metric-card">
+              <dt>点数</dt>
+              <dd id="scene-point-count">-</dd>
+            </div>
+            <div class="metric-card">
+              <dt>Point ID</dt>
+              <dd id="pick-point-id">-</dd>
+            </div>
+            <div class="metric-card">
+              <dt>ROI 点数</dt>
+              <dd id="roi-point-count">-</dd>
+            </div>
+            <div class="metric-card">
+              <dt>Mask 点数</dt>
+              <dd id="mask-point-count">-</dd>
+            </div>
+            <div class="metric-card metric-wide">
+              <dt>范围</dt>
+              <dd id="scene-bounds">-</dd>
+            </div>
+            <div class="metric-card metric-wide">
+              <dt>XYZ</dt>
+              <dd id="pick-xyz">-</dd>
+            </div>
+            <div class="metric-card">
+              <dt>射线距离</dt>
+              <dd id="pick-distance">-</dd>
+            </div>
+            <div class="metric-card">
+              <dt>Mask 置信度</dt>
+              <dd id="mask-confidence">-</dd>
+            </div>
+            <div class="metric-card">
+              <dt>候选类别</dt>
+              <dd id="candidate-label">-</dd>
+            </div>
+            <div class="metric-card">
+              <dt>分类置信度</dt>
+              <dd id="candidate-confidence">-</dd>
+            </div>
+            <div class="metric-card">
+              <dt>候选框类型</dt>
+              <dd id="candidate-box-shape">-</dd>
+            </div>
+            <div class="metric-card">
+              <dt>锚定方式</dt>
+              <dd id="candidate-box-anchor">-</dd>
+            </div>
+            <div class="metric-card">
+              <dt>开口类别</dt>
+              <dd id="opening-label">-</dd>
+            </div>
+            <div class="metric-card">
+              <dt>开口置信度</dt>
+              <dd id="opening-confidence">-</dd>
+            </div>
+            <div class="metric-card metric-wide">
+              <dt>开口说明</dt>
+              <dd id="opening-reason">-</dd>
+            </div>
+            <div class="metric-card">
+              <dt>正样本</dt>
+              <dd id="positive-point-count">0</dd>
+            </div>
+            <div class="metric-card">
+              <dt>负样本</dt>
+              <dd id="negative-point-count">0</dd>
+            </div>
+            <div class="metric-card">
+              <dt>锚定点</dt>
+              <dd id="selection-anchor-point">-</dd>
+            </div>
+            <div class="metric-card">
+              <dt>ROI 半径</dt>
+              <dd id="roi-radius-result">-</dd>
+            </div>
+            <div class="metric-card">
+              <dt>截断</dt>
+              <dd id="roi-truncated">-</dd>
+            </div>
+          </dl>
+        </section>
+      </aside>
+    </main>
+
+    <script type="module" src="/web/app.js"></script>
+  </body>
+</html>
