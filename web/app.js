@@ -788,5 +788,8 @@ function formatSceneDensityLabel(maxPoints) {
   if (resolved <= 600000) {
     return "精细档";
   }
-  return "高精度档";
+  if (resolved <= 1200000) {
+    return "高精度档";
+  }
+  return "超高精度档";
 }

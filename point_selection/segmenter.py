@@ -30,6 +30,17 @@ class SegmentConfig:
     window_surface_seed_band: float = 0.18
     window_surface_min_points: int = 4
     negative_max_hops: int = 2
+    # --- 自适应色差阈值 ---
+    adaptive_color_enabled: bool = True
+    adaptive_color_min_scale: float = 0.8   # 最低倍数（均匀场景收紧）
+    adaptive_color_max_scale: float = 1.8   # 最高倍数（复杂纹理放宽）
+    # --- 法向量约束 ---
+    normal_constraint_enabled: bool = True
+    normal_neighbor_count: int = 8          # 法向量估计 KNN 邻域大小
+    normal_similarity_threshold: float = 0.80  # |cos θ| 下限
+    # --- 投影格梯度裁边 ---
+    color_gradient_trim_enabled: bool = True
+    color_gradient_jump_ratio: float = 2.2  # 边缘跳变相对内部中位数的倍率
 
 
 @dataclass(frozen=True)
@@ -144,12 +155,39 @@ class HeuristicRegionSegmenter:
         except KeyError as exc:
             raise KeyError(f"Seed point {seed_point_id} not found in ROI") from exc
 
+        # ── 自适应色差阈值：根据种子点局部色彩分布动态缩放 ──────────────
+        effective_config = self._config
+        if self._config.adaptive_color_enabled:
+            adaptive_tol = compute_adaptive_color_tolerance(
+                roi_points=roi.points,
+                seed_point=seed_point,
+                base_tolerance=self._config.color_tolerance,
+                search_radius_sq=self._config.neighbor_radius ** 2,
+                min_scale=self._config.adaptive_color_min_scale,
+                max_scale=self._config.adaptive_color_max_scale,
+            )
+            if adaptive_tol != self._config.color_tolerance:
+                import dataclasses
+                effective_config = dataclasses.replace(
+                    self._config, color_tolerance=adaptive_tol
+                )
+
+        # ── 法向量估计：为 ROI 内所有点预计算局部法向量 ─────────────────
+        normals: Dict[int, Tuple[float, float, float]] = {}
+        if self._config.normal_constraint_enabled:
+            normals = estimate_all_normals(
+                roi_points=roi.points,
+                k=self._config.normal_neighbor_count,
+                min_area=self._config.plane_min_area,
+            )
+
         cluster_ids, seed_plane, wall_guidance = segment_point_cluster(
             roi_points=roi.points,
             seed_point_id=seed_point_id,
             scene_structure=scene_structure,
-            config=self._config,
+            config=effective_config,
             use_rectangle_prior=True,
+            normals=normals,
         )
         positive_refinement = apply_positive_refinement(
             base_point_ids=cluster_ids,
@@ -157,7 +195,8 @@ class HeuristicRegionSegmenter:
             seed_point_id=seed_point_id,
             positive_point_ids=positive_point_ids,
             scene_structure=scene_structure,
-            config=self._config,
+            config=effective_config,
+            normals=normals,
         )
         refinement = apply_negative_refinement(
             base_point_ids=positive_refinement.refined_point_ids,
@@ -165,7 +204,7 @@ class HeuristicRegionSegmenter:
             seed_point_id=seed_point_id,
             negative_point_ids=negative_point_ids,
             scene_structure=scene_structure,
-            config=self._config,
+            config=effective_config,
         )
         refined_ids = refinement.refined_point_ids
         confidence = estimate_confidence(
@@ -366,6 +405,7 @@ def segment_point_cluster(
     config: SegmentConfig,
     *,
     use_rectangle_prior: bool,
+    normals: Optional[Dict[int, Tuple[float, float, float]]] = None,
 ) -> Tuple[List[int], Optional[SeedPlane], Optional[WallGuidance]]:
     points_by_id = {point.point_id: point for point in roi_points}
     try:
@@ -399,6 +439,7 @@ def segment_point_cluster(
         )
         return cluster_ids, seed_plane, wall_guidance
 
+    seed_normal = (normals or {}).get(seed_point_id)
     while queue:
         current_id = queue.popleft()
         if current_id in visited:
@@ -417,6 +458,8 @@ def segment_point_cluster(
                 config=config,
                 seed_plane=seed_plane,
                 wall_guidance=wall_guidance,
+                seed_normal=seed_normal,
+                candidate_normal=(normals or {}).get(candidate.point_id),
             ):
                 continue
             queue.append(candidate.point_id)
@@ -487,6 +530,7 @@ def apply_positive_refinement(
     positive_point_ids: Optional[Sequence[int]],
     scene_structure: Optional[SceneStructure],
     config: SegmentConfig,
+    normals: Optional[Dict[int, Tuple[float, float, float]]] = None,
 ) -> PositiveRefinementResult:
     if not positive_point_ids:
         return PositiveRefinementResult(
@@ -510,6 +554,7 @@ def apply_positive_refinement(
             scene_structure=scene_structure,
             config=config,
             use_rectangle_prior=True,
+            normals=normals,
         )
         refined_ids.update(positive_cluster_ids)
         applied_positive_ids.append(positive_point_id)
@@ -596,6 +641,8 @@ def is_neighbor_match(
     config: SegmentConfig,
     seed_plane: Optional[SeedPlane] = None,
     wall_guidance: Optional[WallGuidance] = None,
+    seed_normal: Optional[Tuple[float, float, float]] = None,
+    candidate_normal: Optional[Tuple[float, float, float]] = None,
 ) -> bool:
     if color_distance(seed_point, candidate_point) > config.color_tolerance:
         return False
@@ -605,6 +652,19 @@ def is_neighbor_match(
         return wall_local_distance(current_point, candidate_point, wall_guidance.axis) <= config.neighbor_radius
     if squared_distance(current_point.xyz, candidate_point.xyz) > config.neighbor_radius ** 2:
         return False
+    # ── 法向量约束：仅在非壁面投影模式下生效 ──────────────────────────
+    if (
+        config.normal_constraint_enabled
+        and seed_normal is not None
+        and candidate_normal is not None
+    ):
+        cos_theta = abs(
+            seed_normal[0] * candidate_normal[0]
+            + seed_normal[1] * candidate_normal[1]
+            + seed_normal[2] * candidate_normal[2]
+        )
+        if cos_theta < config.normal_similarity_threshold:
+            return False
     if seed_plane is None or config.plane_distance_tolerance <= 0.0:
         return True
     return point_plane_distance(candidate_point, seed_plane) <= config.plane_distance_tolerance
@@ -735,6 +795,15 @@ def segment_with_wall_projection(
             wall_guidance=wall_guidance,
             rectangle_support=rectangle_support,
             config=config,
+        )
+    # ── 纹理梯度裁边：去除越过颜色边界的投影格 ─────────────────────
+    if config.color_gradient_trim_enabled:
+        selected_ids = refine_mask_by_color_gradient(
+            selected_ids=selected_ids,
+            point_cells=point_cells,
+            point_lookup={point.point_id: point for point in candidate_points},
+            seed_point=seed_point,
+            jump_ratio=config.color_gradient_jump_ratio,
         )
     selected_ids.add(seed_point.point_id)
     return sorted(selected_ids)
@@ -1111,6 +1180,218 @@ def normalize_vector(vector: Sequence[float]) -> Tuple[float, float, float]:
     if length == 0.0:
         raise ValueError("Cannot normalize a zero-length vector")
     return (vector[0] / length, vector[1] / length, vector[2] / length)
+
+
+def compute_adaptive_color_tolerance(
+    roi_points: Sequence[PointRecord],
+    seed_point: PointRecord,
+    base_tolerance: float,
+    search_radius_sq: float,
+    min_scale: float = 0.8,
+    max_scale: float = 1.8,
+) -> float:
+    """根据种子点邻域内的自然色差分布，动态缩放 color_tolerance。
+
+    逻辑：取种子点半径内各点与种子的色差分布的 75th 百分位，
+    以此为基准将 tolerance 锚定到实际色彩变化量，
+    避免固定阈值在均匀场景过松或在纹理场景过紧。
+    """
+    if seed_point.rgb is None:
+        return base_tolerance
+
+    nearby_dists = [
+        color_distance(seed_point, p)
+        for p in roi_points
+        if p.point_id != seed_point.point_id
+        and p.rgb is not None
+        and squared_distance(seed_point.xyz, p.xyz) <= search_radius_sq
+    ]
+    if len(nearby_dists) < 6:
+        return base_tolerance
+
+    nearby_dists.sort()
+    p75 = percentile_value(nearby_dists, 0.75)
+    # p75 较小 → 均匀区域 → 收紧；p75 较大 → 有纹理 → 放宽
+    # 以 p75 * 2.0 作为自然容忍上限，再钳制到 [min_scale, max_scale] 倍数内
+    raw = p75 * 2.0
+    lo = base_tolerance * min_scale
+    hi = base_tolerance * max_scale
+    return max(lo, min(hi, raw if raw > 0 else base_tolerance))
+
+
+def estimate_all_normals(
+    roi_points: Sequence[PointRecord],
+    k: int = 8,
+    min_area: float = 0.005,
+) -> Dict[int, Tuple[float, float, float]]:
+    """对 ROI 内每个点用 KNN + 穷举对叉积估计局部法向量。
+
+    算法：对每个点取 k 个最近邻，从最近的 min(k, 6) 个邻点中两两
+    构造叉积平面，选择内点数最多的平面法向量作为该点的法向量。
+    无需 numpy，与现有 cross_product / normalize_vector 原语共享代码。
+
+    时间复杂度 O(N * (N_local * C(6,2)))；对典型 ROI（≤2000 点）可接受。
+    """
+    point_list = list(roi_points)
+    normals: Dict[int, Tuple[float, float, float]] = {}
+    plane_tolerance = 0.15
+
+    for point in point_list:
+        # 按距离排序，取最近 k 个邻点
+        neighbors: List[Tuple[float, PointRecord]] = sorted(
+            (
+                (squared_distance(point.xyz, p.xyz), p)
+                for p in point_list
+                if p.point_id != point.point_id
+            ),
+            key=lambda item: item[0],
+        )[:k]
+        nearby = [p for _, p in neighbors]
+
+        if len(nearby) < 3:
+            continue
+
+        # 在前 min(k, 6) 个邻点中穷举对，找最佳拟合平面
+        check = nearby[: min(len(nearby), 6)]
+        best_normal: Optional[Tuple[float, float, float]] = None
+        best_inlier = -1
+
+        for i in range(len(check) - 1):
+            left_vec = subtract_vectors(check[i].xyz, point.xyz)
+            for j in range(i + 1, len(check)):
+                right_vec = subtract_vectors(check[j].xyz, point.xyz)
+                raw_normal = cross_product(left_vec, right_vec)
+                area = vector_length(raw_normal)
+                if area < min_area:
+                    continue
+                n_unit = normalize_vector(raw_normal)
+                offset = -dot_product(n_unit, point.xyz)
+                inliers = sum(
+                    abs(dot_product(n_unit, p.xyz) + offset) <= plane_tolerance
+                    for p in nearby
+                )
+                if inliers > best_inlier:
+                    best_inlier = inliers
+                    best_normal = n_unit
+
+        if best_normal is not None:
+            normals[point.point_id] = best_normal
+
+    return normals
+
+
+def refine_mask_by_color_gradient(
+    selected_ids: set,
+    point_cells: Dict[int, Tuple[int, int]],
+    point_lookup: Dict[int, PointRecord],
+    seed_point: PointRecord,
+    jump_ratio: float = 2.2,
+) -> set:
+    """在投影格上做颜色梯度 BFS，剔除跨越颜色突变边界的格子。
+
+    步骤：
+    1. 计算每个格子内点的平均 RGB。
+    2. 统计所有相邻格对之间的色差，取中位数作为基准。
+    3. 从种子格出发做 BFS；若相邻格的色差 > jump_ratio * 中位数，
+       则视为颜色边界，不穿越。
+    4. 只保留 BFS 能到达的格子内的点。
+    """
+    if not selected_ids or seed_point.rgb is None:
+        return selected_ids
+
+    # 构建 cell -> 均色
+    cell_sum: Dict[Tuple[int, int], List[float]] = {}
+    cell_cnt: Dict[Tuple[int, int], int] = {}
+    for point_id in selected_ids:
+        if point_id not in point_cells or point_id not in point_lookup:
+            continue
+        point = point_lookup[point_id]
+        if point.rgb is None:
+            continue
+        cell = point_cells[point_id]
+        if cell not in cell_sum:
+            cell_sum[cell] = [0.0, 0.0, 0.0]
+            cell_cnt[cell] = 0
+        cell_sum[cell][0] += point.rgb[0]
+        cell_sum[cell][1] += point.rgb[1]
+        cell_sum[cell][2] += point.rgb[2]
+        cell_cnt[cell] += 1
+
+    if len(cell_sum) < 4:
+        return selected_ids
+
+    cell_mean: Dict[Tuple[int, int], Tuple[float, float, float]] = {
+        cell: (
+            cell_sum[cell][0] / cell_cnt[cell],
+            cell_sum[cell][1] / cell_cnt[cell],
+            cell_sum[cell][2] / cell_cnt[cell],
+        )
+        for cell in cell_sum
+    }
+
+    # 统计内部相邻格色差（4-邻域）
+    all_jumps: List[float] = []
+    for cell, mean_a in cell_mean.items():
+        for delta in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nb = (cell[0] + delta[0], cell[1] + delta[1])
+            if nb not in cell_mean:
+                continue
+            mean_b = cell_mean[nb]
+            jump = math.sqrt(
+                (mean_a[0] - mean_b[0]) ** 2
+                + (mean_a[1] - mean_b[1]) ** 2
+                + (mean_a[2] - mean_b[2]) ** 2
+            )
+            all_jumps.append(jump)
+
+    if len(all_jumps) < 4:
+        return selected_ids
+
+    median_jump = percentile_value(sorted(all_jumps), 0.5)
+    edge_threshold = max(median_jump * jump_ratio, 12.0)  # 最小 12（0-255 量纲）
+
+    # BFS 从种子格出发，不穿越色差边界
+    seed_cell = point_cells.get(seed_point.point_id)
+    if seed_cell is None or seed_cell not in cell_mean:
+        return selected_ids
+
+    reachable: set = set()
+    queue: deque = deque([seed_cell])
+    visited: set = set()
+
+    while queue:
+        current = queue.popleft()
+        if current in visited:
+            continue
+        visited.add(current)
+        if current not in cell_mean:
+            continue
+        reachable.add(current)
+
+        for delta in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)):
+            nb = (current[0] + delta[0], current[1] + delta[1])
+            if nb in visited or nb not in cell_mean:
+                continue
+            mean_a = cell_mean[current]
+            mean_b = cell_mean[nb]
+            jump = math.sqrt(
+                (mean_a[0] - mean_b[0]) ** 2
+                + (mean_a[1] - mean_b[1]) ** 2
+                + (mean_a[2] - mean_b[2]) ** 2
+            )
+            if jump <= edge_threshold:
+                queue.append(nb)
+
+    refined = {
+        point_id
+        for point_id in selected_ids
+        if point_cells.get(point_id) in reachable
+    }
+    # 保留种子点；结果过小时回退原始
+    refined.add(seed_point.point_id)
+    if len(refined) < max(4, len(selected_ids) * 0.15):
+        return selected_ids
+    return refined
 
 
 def probe_point_sam_modules() -> Tuple[Optional[Dict[str, object]], str]:
